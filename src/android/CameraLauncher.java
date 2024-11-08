@@ -21,10 +21,13 @@ package org.apache.cordova.camera;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.PendingIntent;
+import android.app.RecoverableSecurityException;
 import android.content.ActivityNotFoundException;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.IntentSender;
 import android.content.pm.PackageManager;
 import android.content.pm.PackageManager.NameNotFoundException;
 import android.database.Cursor;
@@ -80,6 +83,7 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
     private static final int PICTURE = 0;               // allow selection of still pictures only. DEFAULT. Will return format specified via DestinationType
     private static final int VIDEO = 1;                 // allow selection of video only, ONLY RETURNS URL
     private static final int ALLMEDIA = 2;              // allow selection from all media types
+    private static final int RECOVERABLE_DELETE_REQUEST = 3; // Result of Recoverable Security Exception
 
     private static final int JPEG = 0;                  // Take a picture of type JPEG
     private static final int PNG = 1;                   // Take a picture of type PNG
@@ -133,6 +137,7 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
     private String croppedFilePath;
     private ExifHelper exifData;            // Exif data from source
     private String applicationId;
+    private Uri pendingDeleteMediaUri;
 
 
     /**
@@ -207,6 +212,11 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
                 PluginResult r = new PluginResult(PluginResult.Status.ERROR);
                 callbackContext.sendPluginResult(r);
                 return true;
+            }
+            catch (Exception ex)
+            {
+                LOG.e(LOG_TAG, "Error occured while calling camera", ex);
+                throw ex;
             }
 
             PluginResult r = new PluginResult(PluginResult.Status.NO_RESULT);
@@ -308,6 +318,7 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
         // Save the number of images currently on disk for later
         this.numPics = queryImgDB(whichContentStore()).getCount();
 
+        LOG.d(LOG_TAG, "Taking a picture");
         // Let's use the intent and see what happens
         Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
 
@@ -364,6 +375,7 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
         } else if (encodingType == PNG) {
             fileName = fileName + PNG_EXTENSION;
         } else {
+            LOG.e(LOG_TAG, "Invalid Encoding Type: " + encodingType);
             throw new IllegalArgumentException("Invalid Encoding Type: " + encodingType);
         }
 
@@ -608,6 +620,7 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
 
             }
         } else {
+            LOG.e(LOG_TAG, "I either have a null image path or bitmap");
             throw new IllegalStateException();
         }
 
@@ -895,6 +908,17 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
             } else {
                 this.failPicture("Selection did not complete!");
             }
+        } else if(requestCode == RECOVERABLE_DELETE_REQUEST) {
+            LOG.d(LOG_TAG, "Retrying media store deletion");
+            // retry media store deletion ...
+            ContentResolver contentResolver = this.cordova.getActivity().getContentResolver();
+            try {
+                contentResolver.delete(this.pendingDeleteMediaUri, null, null);
+                LOG.d(LOG_TAG, "Retrying media store deletion - success");
+            } catch (Exception e) {
+                LOG.e(LOG_TAG, "Unable to delete media store file after permission was granted");
+            }
+            this.pendingDeleteMediaUri = null;
         }
     }
 
@@ -1262,7 +1286,34 @@ public class CameraLauncher extends CordovaPlugin implements MediaScannerConnect
                 id--;
             }
             Uri uri = Uri.parse(contentStore + "/" + id);
-            this.cordova.getActivity().getContentResolver().delete(uri, null, null);
+            try {
+                this.cordova.getActivity().getContentResolver().delete(uri, null, null);
+            } catch (SecurityException securityException) {
+                LOG.d(LOG_TAG, "SecurityException was thrown attempting to delete media store image.");
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    RecoverableSecurityException recoverableSecurityException;
+                    if (securityException instanceof RecoverableSecurityException) {
+                        recoverableSecurityException = (RecoverableSecurityException) securityException;
+                    } else {
+                        LOG.e(LOG_TAG, securityException.getMessage(), securityException);
+                        throw new RuntimeException(securityException.getMessage(), securityException);
+                    }
+                    PendingIntent pendingIntent = recoverableSecurityException.getUserAction().getActionIntent();
+                    this.cordova.setActivityResultCallback(this);
+                    this.pendingDeleteMediaUri = uri;
+                    try {
+                        LOG.d(LOG_TAG, "Attempting to recover from exception");
+                        this.cordova.getActivity().startIntentSenderForResult(pendingIntent.getIntentSender(),
+                                RECOVERABLE_DELETE_REQUEST, null, 0, 0,
+                                0, null);
+                    } catch (IntentSender.SendIntentException e) {
+                        e.printStackTrace();
+                    }
+                } else {
+                    LOG.e(LOG_TAG, securityException.getMessage(), securityException);
+                    throw new RuntimeException(securityException.getMessage(), securityException);
+                }
+            }
             cursor.close();
         }
     }
